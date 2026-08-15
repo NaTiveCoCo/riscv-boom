@@ -92,6 +92,7 @@ case class BoomCoreParams(
   useHypervisor: Boolean = false,
   useVM: Boolean = true,
   useSCIE: Boolean = false,
+  useNACC: Boolean = false,
   useRVE: Boolean = false,
   useBPWatch: Boolean = false,
   clockGate: Boolean = false,
@@ -133,6 +134,44 @@ class BoomTraceBundle extends Bundle {
   */
 class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.CustomCSRs
   with HasBoomCoreParameters {
+  protected def naccStateCSR = {
+    val params = tileParams.core.asInstanceOf[BoomCoreParams]
+    if (params.useNACC) {
+      val id = 0x3f0
+      val writableMask = (BigInt(1) << 52) - 1
+      Some(CustomCSR(id, writableMask, Some(BigInt(0))))
+    } else {
+      None
+    }
+  }
+
+  protected def naccAgentRegionCSRs = {
+    val params = tileParams.core.asInstanceOf[BoomCoreParams]
+    if (params.useNACC) {
+      val pageOffsetBits = 12
+      val pageAlignedAddressMask = (BigInt(1) << xLen) - (BigInt(1) << pageOffsetBits)
+      Seq(
+        CustomCSR(0x3f1, pageAlignedAddressMask, Some(BigInt(0))),
+        CustomCSR(0x3f2, pageAlignedAddressMask, Some(BigInt(0)))
+      )
+    } else {
+      Nil
+    }
+  }
+
+  protected def naccControlFlowCSRs = {
+    val params = tileParams.core.asInstanceOf[BoomCoreParams]
+    if (params.useNACC) {
+      val fullWidthMask = (BigInt(1) << xLen) - 1
+      Seq(
+        CustomCSR(0x5c0, fullWidthMask, Some(BigInt(0))),
+        CustomCSR(0x5c1, fullWidthMask, Some(BigInt(0)))
+      )
+    } else {
+      Nil
+    }
+  }
+
   override def chickenCSR = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
     val mask = BigInt(
@@ -150,9 +189,11 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
+  def naccStateValue = getByIdOrElse(0x3f0, _.value, 0.U(xLen.W))
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
-  override def decls: Seq[CustomCSR] = super.decls :+ marchid
+  override def decls: Seq[CustomCSR] =
+    super.decls ++ Seq(marchid) ++ naccStateCSR ++ naccAgentRegionCSRs ++ naccControlFlowCSRs
 }
 
 /**
