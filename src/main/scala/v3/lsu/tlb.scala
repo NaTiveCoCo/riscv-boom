@@ -16,6 +16,7 @@ import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrM
 
 class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p) {
   require(!instruction)
+  require(!boomParams.useNACC || !usingHypervisor, "NACC does not support hypervisor translation")
   val io = IO(new Bundle {
     val req = Flipped(Vec(memWidth, Decoupled(new TLBReq(lgMaxSize))))
     val miss_rdy = Output(Bool())
@@ -42,6 +43,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val paa = Bool() // AMO arithmetic
     val eff = Bool() // get/put effects
     val c = Bool()
+    val inNACCAgentRegion = boomParams.useNACC.option(Bool())
     val fragmented_superpage = Bool()
   }
 
@@ -149,6 +151,15 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
                 Mux(do_refill, refill_ppn,
                 Mux(vm_enabled(w) && special_entry.nonEmpty.B, special_entry.map(_.ppn(vpn(w))).getOrElse(0.U), io.req(w).bits.vaddr >> pgIdxBits)))
   val mpu_physaddr = widthMap(w => Cat(mpu_ppn(w), io.req(w).bits.vaddr(pgIdxBits-1, 0)))
+  def inNACCAgentRegion(addr: UInt): Bool = if (boomParams.useNACC) {
+    val physicalAddress = addr.padTo(xLen)
+    physicalAddress >= io.ptw.customCSRs.naccSagentValue &&
+      physicalAddress < io.ptw.customCSRs.naccEagentValue
+  } else {
+    false.B
+  }
+  val naccAgentMode = if (boomParams.useNACC) io.ptw.customCSRs.naccStateValue(49, 48) === 1.U else false.B
+  val naccPrivilegeAllowed = priv === PRV.M.U || (priv === PRV.S.U && naccAgentMode)
   val pmp = Seq.fill(memWidth) { Module(new PMPChecker(lgMaxSize)) }
   for (w <- 0 until memWidth) {
     pmp(w).io.addr := mpu_physaddr(w)
@@ -193,6 +204,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     newEntry.pal := prot_al(0)
     newEntry.paa := prot_aa(0)
     newEntry.eff := prot_eff(0)
+    newEntry.inNACCAgentRegion.foreach(_ := inNACCAgentRegion(refill_ppn << pgIdxBits))
     newEntry.fragmented_superpage := io.ptw.resp.bits.fragmented_superpage
 
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
@@ -219,9 +231,16 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val r_array      = widthMap(w => Cat(true.B, priv_rw_ok(w) & (entries(w).map(_.sr).asUInt | Mux(io.ptw.status.mxr, entries(w).map(_.sx).asUInt, 0.U))))
   val w_array      = widthMap(w => Cat(true.B, priv_rw_ok(w) & entries(w).map(_.sw).asUInt))
   val x_array      = widthMap(w => Cat(true.B, priv_x_ok(w)  & entries(w).map(_.sx).asUInt))
-  val pr_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_r(w))   , normal_entries(w).map(_.pr).asUInt) & ~ptw_ae_array(w))
-  val pw_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_w(w))   , normal_entries(w).map(_.pw).asUInt) & ~ptw_ae_array(w))
-  val px_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_x(w))   , normal_entries(w).map(_.px).asUInt) & ~ptw_ae_array(w))
+  val nacc_access_array = widthMap(w => if (boomParams.useNACC) {
+    val physicalAccessAllowed = !inNACCAgentRegion(mpu_physaddr(w)) || naccPrivilegeAllowed
+    val entryAccessAllowed = normal_entries(w).map(e => !e.inNACCAgentRegion.get || naccPrivilegeAllowed)
+    Cat(Fill(nPhysicalEntries, physicalAccessAllowed), entryAccessAllowed.asUInt)
+  } else {
+    Fill(nPhysicalEntries + normal_entries(w).size, true.B)
+  })
+  val pr_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_r(w))   , normal_entries(w).map(_.pr).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w))
+  val pw_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_w(w))   , normal_entries(w).map(_.pw).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w))
+  val px_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_x(w))   , normal_entries(w).map(_.px).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w))
   val eff_array    = widthMap(w => Cat(Fill(nPhysicalEntries, prot_eff(w)) , normal_entries(w).map(_.eff).asUInt))
   val c_array      = widthMap(w => Cat(Fill(nPhysicalEntries, cacheable(w)), normal_entries(w).map(_.c).asUInt))
   val paa_array    = widthMap(w => Cat(Fill(nPhysicalEntries, prot_aa(w))  , normal_entries(w).map(_.paa).asUInt))

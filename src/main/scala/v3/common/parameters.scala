@@ -108,6 +108,7 @@ case class BoomCoreParams(
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
 {
+  override def hasNACC: Boolean = useNACC
   override def traceCustom = Some(new BoomTraceBundle)
   val xLen = 64
   val haveFSDirty = true
@@ -189,7 +190,9 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
-  def naccStateValue = getByIdOrElse(0x3f0, _.value, 0.U(xLen.W))
+  override def naccStateValue = getByIdOrElse(0x3f0, _.value, 0.U(xLen.W))
+  override def naccSagentValue = getByIdOrElse(0x3f1, _.value, 0.U(xLen.W))
+  override def naccEagentValue = getByIdOrElse(0x3f2, _.value, 0.U(xLen.W))
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
   override def decls: Seq[CustomCSR] =

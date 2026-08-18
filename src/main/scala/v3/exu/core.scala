@@ -277,6 +277,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   custom_csrs.csrs.foreach { c => c.stall := false.B; c.set := false.B; c.sdata := DontCare }
 
   (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
+  (io.ptw.customCSRs.csrs zip custom_csrs.csrs).foreach { case (out, local) =>
+    out.ren := local.ren
+    out.wen := local.wen
+    out.wdata := local.wdata
+    out.value := local.value
+  }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
