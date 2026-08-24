@@ -12,6 +12,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.Instructions32
 import freechips.rocketchip.rocket.CustomInstructions._
+import freechips.rocketchip.rocket.NACCInstructions
 import freechips.rocketchip.rocket.RVCExpander
 import freechips.rocketchip.rocket.{CSR,Causes,PRV}
 import freechips.rocketchip.util.{uintToBitPat,UIntIsOneOf}
@@ -469,6 +470,14 @@ class DecodeUnitIo(implicit p: Parameters) extends BoomBundle
   val interrupt_cause = Input(UInt(xLen.W))
 }
 
+object NACCDecode extends DecodeConstants
+{
+  val table: Array[(BitPat, List[BitPat])] = Array(
+    NACCInstructions.ACALL -> List(Y, N, X, uopERET, IQT_INT, FU_CSR, RT_X, RT_X, RT_X, N, IS_I, N, N, N, N, N, M_X, 0.U, N, N, Y, Y, Y, CSR.I),
+    NACCInstructions.ARET  -> List(Y, N, X, uopERET, IQT_INT, FU_CSR, RT_X, RT_X, RT_X, N, IS_I, N, N, N, N, N, M_X, 0.U, N, N, Y, Y, Y, CSR.I)
+  )
+}
+
 /**
  * Decode unit that takes in a single instruction and generates a MicroOp.
  */
@@ -488,7 +497,15 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
 
   val inst = uop.inst
 
-  val cs = Wire(new CtrlSigs()).decode(inst, decode_table)
+  val cs = if (boomParams.useNACC) {
+    val base_cs = Wire(new CtrlSigs()).decode(inst, decode_table)
+    val nacc_cs = Wire(new CtrlSigs()).decode(inst, NACCDecode.table)
+    val is_nacc_system =
+      inst === NACCInstructions.ACALL.value.U || inst === NACCInstructions.ARET.value.U
+    Mux(is_nacc_system, nacc_cs, base_cs)
+  } else {
+    Wire(new CtrlSigs()).decode(inst, decode_table)
+  }
 
   // Exception Handling
   io.csr_decode.inst := inst

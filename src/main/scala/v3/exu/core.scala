@@ -1010,6 +1010,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   csr.io.rw.addr        := csr_exe_unit.io.iresp.bits.uop.csr_addr
   csr.io.rw.cmd         := freechips.rocketchip.rocket.CSR.maskCmd(csr_exe_unit.io.iresp.valid, csr_rw_cmd)
+  csr.io.rw.inst.foreach(_ := csr_exe_unit.io.iresp.bits.uop.inst)
   csr.io.rw.wdata       := wb_wdata
 
   rob.io.csr_replay.valid := csr_exe_unit.io.iresp.valid && csr.io.rw_stall
