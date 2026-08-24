@@ -146,19 +146,20 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     }
   }
 
-  protected def naccAgentRegionCSRs = {
+  private def naccPageAlignedCSRs(ids: Int*): Seq[CustomCSR] = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
     if (params.useNACC) {
       val pageOffsetBits = 12
       val pageAlignedAddressMask = (BigInt(1) << xLen) - (BigInt(1) << pageOffsetBits)
-      Seq(
-        CustomCSR(0x3f1, pageAlignedAddressMask, Some(BigInt(0))),
-        CustomCSR(0x3f2, pageAlignedAddressMask, Some(BigInt(0)))
-      )
+      ids.map(id => CustomCSR(id, pageAlignedAddressMask, Some(BigInt(0))))
     } else {
       Nil
     }
   }
+
+  protected def naccAgentRegionCSRs = naccPageAlignedCSRs(0x3f1, 0x3f2)
+
+  protected def naccBitmapCSRs = naccPageAlignedCSRs(0x3f3, 0x3f4, 0x3f5)
 
   protected def naccControlFlowCSRs = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
@@ -193,10 +194,13 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   override def naccStateValue = getByIdOrElse(0x3f0, _.value, 0.U(xLen.W))
   override def naccSagentValue = getByIdOrElse(0x3f1, _.value, 0.U(xLen.W))
   override def naccEagentValue = getByIdOrElse(0x3f2, _.value, 0.U(xLen.W))
+  override def naccBitmapStorageBaseValue = getByIdOrElse(0x3f3, _.value, 0.U(xLen.W))
+  override def naccBitmapTargetStartValue = getByIdOrElse(0x3f4, _.value, 0.U(xLen.W))
+  override def naccBitmapTargetEndValue = getByIdOrElse(0x3f5, _.value, 0.U(xLen.W))
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
   override def decls: Seq[CustomCSR] =
-    super.decls ++ Seq(marchid) ++ naccStateCSR ++ naccAgentRegionCSRs ++ naccControlFlowCSRs
+    super.decls ++ Seq(marchid) ++ naccStateCSR ++ naccAgentRegionCSRs ++ naccBitmapCSRs ++ naccControlFlowCSRs
 }
 
 /**
