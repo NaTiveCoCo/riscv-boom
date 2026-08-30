@@ -12,8 +12,9 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.Instructions32
 import freechips.rocketchip.rocket.CustomInstructions._
+import freechips.rocketchip.rocket.NACCInstructions
 import freechips.rocketchip.rocket.RVCExpander
-import freechips.rocketchip.rocket.{CSR,Causes}
+import freechips.rocketchip.rocket.{CSR,Causes,PRV}
 import freechips.rocketchip.util.{uintToBitPat,UIntIsOneOf}
 
 import FUConstants._
@@ -463,9 +464,18 @@ class DecodeUnitIo(implicit p: Parameters) extends BoomBundle
 
   // from CSRFile
   val status = Input(new freechips.rocketchip.rocket.MStatus())
+  val naccState = Input(UInt(xLen.W))
   val csr_decode = Flipped(new freechips.rocketchip.rocket.CSRDecodeIO)
   val interrupt = Input(Bool())
   val interrupt_cause = Input(UInt(xLen.W))
+}
+
+object NACCDecode extends DecodeConstants
+{
+  val table: Array[(BitPat, List[BitPat])] = Array(
+    NACCInstructions.ACALL -> List(Y, N, X, uopERET, IQT_INT, FU_CSR, RT_X, RT_X, RT_X, N, IS_I, N, N, N, N, N, M_X, 0.U, N, N, Y, Y, Y, CSR.I),
+    NACCInstructions.ARET  -> List(Y, N, X, uopERET, IQT_INT, FU_CSR, RT_X, RT_X, RT_X, N, IS_I, N, N, N, N, N, M_X, 0.U, N, N, Y, Y, Y, CSR.I)
+  )
 }
 
 /**
@@ -487,7 +497,15 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
 
   val inst = uop.inst
 
-  val cs = Wire(new CtrlSigs()).decode(inst, decode_table)
+  val cs = if (boomParams.useNACC) {
+    val base_cs = Wire(new CtrlSigs()).decode(inst, decode_table)
+    val nacc_cs = Wire(new CtrlSigs()).decode(inst, NACCDecode.table)
+    val is_nacc_system =
+      inst === NACCInstructions.ACALL.value.U || inst === NACCInstructions.ARET.value.U
+    Mux(is_nacc_system, nacc_cs, base_cs)
+  } else {
+    Wire(new CtrlSigs()).decode(inst, decode_table)
+  }
 
   // Exception Handling
   io.csr_decode.inst := inst
@@ -495,6 +513,14 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   val csr_ren = cs.csr_cmd.isOneOf(CSR.S, CSR.C) && uop.lrs1 === 0.U
   val system_insn = cs.csr_cmd === CSR.I
   val sfence = cs.uopc === uopSFENCE
+
+  val isNACCControlFlowCSR = inst(31,20).isOneOf(0x5c0.U, 0x5c1.U)
+  val isNACCAgentState = io.naccState(49,48) === 1.U
+  val naccSModeWriteIllegal = boomParams.useNACC.B &&
+    csr_en && !csr_ren &&
+    isNACCControlFlowCSR &&
+    io.status.prv === PRV.S.U &&
+    !isNACCAgentState
 
   val cs_legal = cs.legal
 //   dontTouch(cs_legal)
@@ -505,6 +531,7 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
     cs.is_amo && !io.status.isa('a'-'a')  ||
     (cs.fp_val && !cs.fp_single) && !io.status.isa('d'-'a') ||
     csr_en && (io.csr_decode.read_illegal || !csr_ren && io.csr_decode.write_illegal) ||
+    naccSModeWriteIllegal ||
     ((sfence || system_insn) && io.csr_decode.system_illegal)
 
 //     cs.div && !csr.io.status.isa('m'-'a') || TODO check for illegal div instructions

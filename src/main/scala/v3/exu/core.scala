@@ -277,6 +277,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   custom_csrs.csrs.foreach { c => c.stall := false.B; c.set := false.B; c.sdata := DontCare }
 
   (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
+  (io.ptw.customCSRs.csrs zip custom_csrs.csrs).foreach { case (out, local) =>
+    out.ren := local.ren
+    out.wen := local.wen
+    out.wdata := local.wdata
+    out.value := local.value
+  }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
@@ -509,6 +515,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                                           !dec_finished_mask(w)
     decode_units(w).io.enq.uop         := dec_fbundle.uops(w).bits
     decode_units(w).io.status          := csr.io.status
+    decode_units(w).io.naccState       := custom_csrs.naccStateValue
     decode_units(w).io.csr_decode      <> csr.io.decode(w)
     decode_units(w).io.interrupt       := csr.io.interrupt
     decode_units(w).io.interrupt_cause := csr.io.interrupt_cause
@@ -1003,6 +1010,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   csr.io.rw.addr        := csr_exe_unit.io.iresp.bits.uop.csr_addr
   csr.io.rw.cmd         := freechips.rocketchip.rocket.CSR.maskCmd(csr_exe_unit.io.iresp.valid, csr_rw_cmd)
+  csr.io.rw.inst.foreach(_ := csr_exe_unit.io.iresp.bits.uop.inst)
   csr.io.rw.wdata       := wb_wdata
 
   rob.io.csr_replay.valid := csr_exe_unit.io.iresp.valid && csr.io.rw_stall
