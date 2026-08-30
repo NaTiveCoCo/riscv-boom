@@ -158,8 +158,8 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   } else {
     false.B
   }
-  // 处于 A 世界（AS 或 AU）。`A` 位由 CSRFile 并入 nacc_status 的对外 value。
-  val naccAgentMode = if (boomParams.useNACC) io.ptw.customCSRs.naccStatusValue(freechips.rocketchip.rocket.NACCStatus.A) else false.B
+  // 处于 A 世界（AS 或 AU）。`A` 位由 CSRFile 并入 asstatus 的对外 value。
+  val naccAgentMode = if (boomParams.useNACC) io.ptw.customCSRs.asStatusValue(freechips.rocketchip.rocket.NACCStatus.A) else false.B
   val naccPrivilegeAllowed = priv === PRV.M.U || (priv === PRV.S.U && naccAgentMode)
   val pmp = Seq.fill(memWidth) { Module(new PMPChecker(lgMaxSize)) }
   for (w <- 0 until memWidth) {
