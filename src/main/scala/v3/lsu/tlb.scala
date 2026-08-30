@@ -198,9 +198,6 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     * 一个 bit，这类不一致随之消失。
     */
   val naccAgentMode = if (boomParams.useNACC) io.ptw.customCSRs.asStatusValue(NACCStatus.A) else false.B
-  /** 机密执行期。A-mode 下与 `naccAgentMode` 是同一件事，保留名字以对应 top-root
-    * role gate 的术语。 */
-  val naccConfidentialActive = naccAgentMode
   val naccRootPageAddress = io.ptw.ptbr.ppn << pgIdxBits
   val naccRootInBitmapTarget = if (boomParams.useNACC) {
     inNACCBitmapTargetRange(naccRootPageAddress)
@@ -217,11 +214,13 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   } else {
     NACCBitmapTag.Normal.U
   }
+  /** top-root role gate。只约束「`A=1` 时根表必须是 `ROOT_L0`」这一个方向；
+    * 反方向（`A=0` 不许装 `ROOT_L0`）与「世界切换不改 `satp`」冲突，已删除。
+    * 详见 rocket 侧 `TLB.scala` 中同名信号的说明。 */
   val naccRootAllowed = if (boomParams.useNACC) {
-    Mux(naccConfidentialActive,
-      io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) && naccRootInBitmapTarget &&
-        naccRootTagKnown && naccRootTag === NACCBitmapTag.RootL0.U,
-      !naccRootInBitmapTarget || (naccRootTagKnown && naccRootTag === NACCBitmapTag.Normal.U))
+    !naccAgentMode ||
+      (io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) && naccRootInBitmapTarget &&
+        naccRootTagKnown && naccRootTag === NACCBitmapTag.RootL0.U)
   } else {
     true.B
   }
@@ -335,11 +334,17 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   } else {
     Fill(nPhysicalEntries + normal_entries(w).size, true.B)
   })
+  /** `ROOT_L0` 页的读权限：只有**当前装着的那张**根页表可以被 S/U 读，其余
+    * `ROOT_L0` 页（别的容器的根表）一律拒绝。
+    *
+    * 不看 `A`：Linux 的软件页表遍历需要读它正在用的这张 PGD，而按 §「世界切换不改
+    * `satp`」，`A=0` 时装着容器 PGD 是常态。AS 侧同样需要读，且对 AS 无需设限——
+    * 它是容器的 TCB。读整页放行、写只放行内核半，保护落在写那一侧。
+    */
   val naccRootReadArray = widthMap(w => if (boomParams.useNACC) {
     def allowed(tag: UInt, finalPPN: UInt): Bool = {
       priv === PRV.M.U || tag =/= NACCBitmapTag.RootL0.U ||
-        (naccConfidentialActive && io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) &&
-          finalPPN === io.ptw.ptbr.ppn)
+        (io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) && finalPPN === io.ptw.ptbr.ppn)
     }
     val physicalTag = Mux(naccBareBitmapLookupRequired(w), naccBareTag.get, NACCBitmapTag.Normal.U)
     val physicalAllowed = !naccBareBitmapLookupRequired(w) ||
@@ -358,9 +363,16 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val accessEnd = accessStart +& accessBytes
     val entirelyInKernelHalf = accessStart >= (BigInt(1) << (pgIdxBits - 1)).U &&
       accessEnd <= (BigInt(1) << pgIdxBits).U
+    // **这条是用户半保护的落点。** S 只能写当前装着的那张根页表，且访问 span 必须
+    // 完整落在内核半 `[0x800,0x1000)`——于是不可信的 Linux 改不了 entry 0..255，
+    // 无法重映射 agent 的地址空间，§「两类攻击」的共同前提就此消失。
+    //
+    // 同样不看 `A`：内核半本来就该由 Linux 在 `A=0` 时直接维护（vmalloc 同步），
+    // 那正是这条 sub-page 规则换掉一条运行期 SBI 的理由；若要求 `A=1`，Linux 永远
+    // 写不了内核半，这条规则的存在意义就没了。AS 落在同一条规则里，不另设限制。
     def allowed(tag: UInt, finalPPN: UInt): Bool = {
       priv === PRV.M.U || tag =/= NACCBitmapTag.RootL0.U ||
-        (priv === PRV.S.U && naccConfidentialActive &&
+        (priv === PRV.S.U &&
           io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) && finalPPN === io.ptw.ptbr.ppn &&
           entirelyInKernelHalf)
     }
@@ -395,8 +407,9 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
       io.ptw.ptbr.additionalPgLevels === i.U && !(maskedVAddr === 0.U || maskedVAddr === mask)
     }).orR
   })
+  // 与 rocket 侧一致：root tag 只有 `A=1` 时被 `naccRootAllowed` 消费，故只在那时才取。
   val naccRootValidationMiss = widthMap(w => boomParams.useNACC.B && vm_enabled(w) && !bad_va(w) &&
-    naccRootInBitmapTarget && !naccRootTagKnown && !naccBitmapFatalApplies(w))
+    naccAgentMode && naccRootInBitmapTarget && !naccRootTagKnown && !naccBitmapFatalApplies(w))
   val naccRootDenied = widthMap(w => boomParams.useNACC.B && vm_enabled(w) && !bad_va(w) &&
     !naccRootValidationMiss(w) && !naccRootAllowed && !naccBitmapFatalApplies(w))
 
