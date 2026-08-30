@@ -12,7 +12,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.Instructions32
 import freechips.rocketchip.rocket.CustomInstructions._
-import freechips.rocketchip.rocket.NACCInstructions
+
 import freechips.rocketchip.rocket.RVCExpander
 import freechips.rocketchip.rocket.{CSR,Causes,PRV}
 import freechips.rocketchip.util.{uintToBitPat,UIntIsOneOf}
@@ -464,18 +464,9 @@ class DecodeUnitIo(implicit p: Parameters) extends BoomBundle
 
   // from CSRFile
   val status = Input(new freechips.rocketchip.rocket.MStatus())
-  val naccState = Input(UInt(xLen.W))
   val csr_decode = Flipped(new freechips.rocketchip.rocket.CSRDecodeIO)
   val interrupt = Input(Bool())
   val interrupt_cause = Input(UInt(xLen.W))
-}
-
-object NACCDecode extends DecodeConstants
-{
-  val table: Array[(BitPat, List[BitPat])] = Array(
-    NACCInstructions.ACALL -> List(Y, N, X, uopERET, IQT_INT, FU_CSR, RT_X, RT_X, RT_X, N, IS_I, N, N, N, N, N, M_X, 0.U, N, N, Y, Y, Y, CSR.I),
-    NACCInstructions.ARET  -> List(Y, N, X, uopERET, IQT_INT, FU_CSR, RT_X, RT_X, RT_X, N, IS_I, N, N, N, N, N, M_X, 0.U, N, N, Y, Y, Y, CSR.I)
-  )
 }
 
 /**
@@ -497,15 +488,9 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
 
   val inst = uop.inst
 
-  val cs = if (boomParams.useNACC) {
-    val base_cs = Wire(new CtrlSigs()).decode(inst, decode_table)
-    val nacc_cs = Wire(new CtrlSigs()).decode(inst, NACCDecode.table)
-    val is_nacc_system =
-      inst === NACCInstructions.ACALL.value.U || inst === NACCInstructions.ARET.value.U
-    Mux(is_nacc_system, nacc_cs, base_cs)
-  } else {
-    Wire(new CtrlSigs()).decode(inst, decode_table)
-  }
+  // A-mode 不新增指令：世界切换复用 ECALL/SRET，因此这里不再有 NACC 专用的
+  // decode table 与覆盖式 Mux，custom-0 opcode 也归还给 RoCC。
+  val cs = Wire(new CtrlSigs()).decode(inst, decode_table)
 
   // Exception Handling
   io.csr_decode.inst := inst
@@ -514,14 +499,8 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   val system_insn = cs.csr_cmd === CSR.I
   val sfence = cs.uopc === uopSFENCE
 
-  val isNACCControlFlowCSR = inst(31,20).isOneOf(0x5c0.U, 0x5c1.U)
-  val isNACCAgentState = io.naccState(49,48) === 1.U
-  val naccSModeWriteIllegal = boomParams.useNACC.B &&
-    csr_en && !csr_ren &&
-    isNACCControlFlowCSR &&
-    io.status.prv === PRV.S.U &&
-    !isNACCAgentState
-
+  // twin_entry/trampoline 的 S-mode 动态写门控随这两个 CSR 一起消失：A 世界的
+  // trap CSR 改为独立编号、按「A=1 或 M」做普通访问控制，不再需要按 state 判定。
   val cs_legal = cs.legal
 //   dontTouch(cs_legal)
 
@@ -531,7 +510,6 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
     cs.is_amo && !io.status.isa('a'-'a')  ||
     (cs.fp_val && !cs.fp_single) && !io.status.isa('d'-'a') ||
     csr_en && (io.csr_decode.read_illegal || !csr_ren && io.csr_decode.write_illegal) ||
-    naccSModeWriteIllegal ||
     ((sfence || system_insn) && io.csr_decode.system_illegal)
 
 //     cs.div && !csr.io.status.isa('m'-'a') || TODO check for illegal div instructions

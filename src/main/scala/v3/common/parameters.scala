@@ -135,14 +135,20 @@ class BoomTraceBundle extends Bundle {
   */
 class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.CustomCSRs
   with HasBoomCoreParameters {
-  protected def naccStateCSR = {
+  // NACC A-mode 的两个 M-mode CSR。落在 machine custom RW 区（0x7c0-0x7ff），
+  // 不占标准 M-mode 空间——标准只承诺 custom 区不会被将来的扩展重新定义。
+  //
+  // nacc_status 的写掩码在这里放开全部有存储的位；按当前 mode 的细分掩码由
+  // CSRFile 施加（见 rocket 的 NACCStatus）。`A` 位没有存储，故不在掩码内。
+  protected def naccStatusCSRs = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
     if (params.useNACC) {
-      val id = 0x3f0
-      val writableMask = (BigInt(1) << 52) - 1
-      Some(CustomCSR(id, writableMask, Some(BigInt(0))))
+      Seq(
+        CustomCSR(NACCCSRs.nacc_status, NACCStatus.StoredMask, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.nacc_aentry, (BigInt(1) << xLen) - 1, Some(BigInt(0)))
+      )
     } else {
-      None
+      Nil
     }
   }
 
@@ -160,18 +166,6 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     }
   }
 
-  protected def naccControlFlowCSRs = {
-    val params = tileParams.core.asInstanceOf[BoomCoreParams]
-    if (params.useNACC) {
-      val fullWidthMask = (BigInt(1) << xLen) - 1
-      Seq(
-        CustomCSR(0x5c0, fullWidthMask, Some(BigInt(0))),
-        CustomCSR(0x5c1, fullWidthMask, Some(BigInt(0)))
-      )
-    } else {
-      Nil
-    }
-  }
 
   override def chickenCSR = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
@@ -190,13 +184,14 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
-  override def naccStateValue = getByIdOrElse(0x3f0, _.value, 0.U(xLen.W))
+  override def naccStatusValue = getByIdOrElse(NACCCSRs.nacc_status, _.value, 0.U(xLen.W))
+  override def naccAentryValue = getByIdOrElse(NACCCSRs.nacc_aentry, _.value, 0.U(xLen.W))
   override def naccSagentValue = getByIdOrElse(0x3f1, _.value, 0.U(xLen.W))
   override def naccEagentValue = getByIdOrElse(0x3f2, _.value, 0.U(xLen.W))
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
   override def decls: Seq[CustomCSR] =
-    super.decls ++ Seq(marchid) ++ naccStateCSR ++ naccAgentRegionCSRs ++ naccControlFlowCSRs
+    super.decls ++ Seq(marchid) ++ naccStatusCSRs ++ naccAgentRegionCSRs
 }
 
 /**
