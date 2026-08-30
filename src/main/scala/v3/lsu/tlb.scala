@@ -17,6 +17,8 @@ import boom.v3.util.{BoolToChar, AgePriorityEncoder, IsKilledByBranch, GetNewBrM
 class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p) {
   require(!instruction)
   require(!boomParams.useNACC || !usingHypervisor, "NACC does not support hypervisor translation")
+  require(!boomParams.useNACC || (xLen == 64 && pgLevels == 3 && pgLevelBits == 9 && pgIdxBits == 12),
+    "NACC currently requires RV64 Sv39")
   val io = IO(new Bundle {
     val req = Flipped(Vec(memWidth, Decoupled(new TLBReq(lgMaxSize))))
     val miss_rdy = Output(Bool())
@@ -44,6 +46,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val eff = Bool() // get/put effects
     val c = Bool()
     val inNACCAgentRegion = boomParams.useNACC.option(Bool())
+    val naccBitmapTag = boomParams.useNACC.option(UInt(NACCBitmapTag.Width.W))
     val fragmented_superpage = Bool()
   }
 
@@ -131,6 +134,14 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
 
   val s_ready :: s_request :: s_wait :: s_wait_invalidate :: Nil = Enum(4)
   val state = RegInit(s_ready)
+  val r_naccBitmapOnly = boomParams.useNACC.option(RegInit(false.B))
+  val r_naccBitmapPPN = boomParams.useNACC.option(Reg(UInt(ppnBits.W)))
+  val r_naccRootValidationOnly = boomParams.useNACC.option(RegInit(false.B))
+  val r_naccPendingRequestEffectiveSU = boomParams.useNACC.option(Reg(Bool()))
+  val r_naccBitmapResponseStale = boomParams.useNACC.option(RegInit(false.B))
+  val naccBareTagValid = boomParams.useNACC.option(RegInit(false.B))
+  val naccBareTagPPN = boomParams.useNACC.option(Reg(UInt(ppnBits.W)))
+  val naccBareTag = boomParams.useNACC.option(Reg(UInt(NACCBitmapTag.Width.W)))
   val r_refill_tag = Reg(UInt(vpnBits.W))
   val r_superpage_repl_addr = Reg(UInt(log2Ceil(superpage_entries.size).W))
   val r_sectored_repl_addr = Reg(UInt(log2Ceil(sectored_entries.size).W))
@@ -141,11 +152,25 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val priv_s = priv(0)
   val priv_uses_vm = priv <= PRV.S.U
   val vm_enabled = widthMap(w => usingVM.B && io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth-1) && priv_uses_vm && !io.req(w).bits.passthrough)
+  val naccBitmapFatal = if (boomParams.useNACC) io.ptw.naccBitmapFatal.get else false.B
+  val naccBitmapFatalApplies = widthMap(w =>
+    naccBitmapFatal && priv_uses_vm && !io.req(w).bits.passthrough)
 
   // share a single physical memory attribute checker (unshare if critical path)
   val vpn = widthMap(w => io.req(w).bits.vaddr(vaddrBits-1, pgIdxBits))
   val refill_ppn = io.ptw.resp.bits.pte.ppn(ppnBits-1, 0)
-  val do_refill = usingVM.B && io.ptw.resp.valid
+  val naccBitmapOnlyResponse = if (boomParams.useNACC) {
+    usingVM.B && io.ptw.resp.valid && io.ptw.resp.bits.naccBitmapOnly.get
+  } else {
+    false.B
+  }
+  val naccRootValidationOnlyResponse = if (boomParams.useNACC) {
+    naccBitmapOnlyResponse && io.ptw.resp.bits.naccRootValidationOnly.get
+  } else {
+    false.B
+  }
+  val ptwTranslationResponse = usingVM.B && io.ptw.resp.valid && !naccBitmapOnlyResponse
+  val do_refill = ptwTranslationResponse && !naccBitmapFatal
   val invalidate_refill = state.isOneOf(s_request /* don't care */, s_wait_invalidate) || io.sfence.valid
   val mpu_ppn = widthMap(w =>
                 Mux(do_refill, refill_ppn,
@@ -158,15 +183,80 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   } else {
     false.B
   }
-  // 处于 A 世界（AS 或 AU）。`A` 位由 CSRFile 并入 asstatus 的对外 value。
-  val naccAgentMode = if (boomParams.useNACC) io.ptw.customCSRs.asStatusValue(freechips.rocketchip.rocket.NACCStatus.A) else false.B
-  val naccPrivilegeAllowed = priv === PRV.M.U || (priv === PRV.S.U && naccAgentMode)
+  def inNACCBitmapTargetRange(addr: UInt): Bool = if (boomParams.useNACC) {
+    val physicalAddress = addr.padTo(xLen)
+    physicalAddress >= io.ptw.customCSRs.naccBitmapTargetStartValue &&
+      physicalAddress < io.ptw.customCSRs.naccBitmapTargetEndValue
+  } else {
+    false.B
+  }
+  /** 处于 A 世界（AS 或 AU）。
+    *
+    * `A` 位由 CSRFile 并入 `asstatus` 的对外 value，随世界切换由硬件维护、软件写不进。
+    * 全文件只有这一个「在不在 agent」的判据——早期相位模型的两个谓词（一个只看 state
+    * 字段，一个还要求 CID 非零并区分 pendingReturn）可以给出相反答案，`A` 把它们合成
+    * 一个 bit，这类不一致随之消失。
+    */
+  val naccAgentMode = if (boomParams.useNACC) io.ptw.customCSRs.asStatusValue(NACCStatus.A) else false.B
+  /** 机密执行期。A-mode 下与 `naccAgentMode` 是同一件事，保留名字以对应 top-root
+    * role gate 的术语。 */
+  val naccConfidentialActive = naccAgentMode
+  val naccRootPageAddress = io.ptw.ptbr.ppn << pgIdxBits
+  val naccRootInBitmapTarget = if (boomParams.useNACC) {
+    inNACCBitmapTargetRange(naccRootPageAddress)
+  } else {
+    false.B
+  }
+  val naccRootTagKnown = if (boomParams.useNACC) {
+    !naccRootInBitmapTarget || io.ptw.naccRootTagValid.get
+  } else {
+    true.B
+  }
+  val naccRootTag = if (boomParams.useNACC) {
+    Mux(naccRootInBitmapTarget, io.ptw.naccRootTag.get, NACCBitmapTag.Normal.U)
+  } else {
+    NACCBitmapTag.Normal.U
+  }
+  val naccRootAllowed = if (boomParams.useNACC) {
+    Mux(naccConfidentialActive,
+      io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) && naccRootInBitmapTarget &&
+        naccRootTagKnown && naccRootTag === NACCBitmapTag.RootL0.U,
+      !naccRootInBitmapTarget || (naccRootTagKnown && naccRootTag === NACCBitmapTag.Normal.U))
+  } else {
+    true.B
+  }
+  val naccEntryPrivilegeAllowed = priv === PRV.M.U || (priv === PRV.S.U && naccAgentMode)
+  // Bare最终physical PFN与TLBResp.paddr使用同一截断宽度，不能携带virtual高位。
+  val naccBarePPN = widthMap(w => mpu_ppn(w)(ppnBits-1, 0))
+  val naccBarePageAddress = widthMap(w => naccBarePPN(w) << pgIdxBits)
+  val naccBareBitmapLookupRequired = widthMap(w => if (boomParams.useNACC) {
+    priv_uses_vm && !io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth-1) && !io.req(w).bits.passthrough &&
+      inNACCBitmapTargetRange(naccBarePageAddress(w)) && !inNACCAgentRegion(naccBarePageAddress(w))
+  } else {
+    false.B
+  })
+  val naccBareTagHit = widthMap(w => if (boomParams.useNACC) {
+    naccBareTagValid.get && naccBareTagPPN.get === naccBarePPN(w)
+  } else {
+    false.B
+  })
+  val naccBareBitmapMiss = widthMap(w =>
+    naccBareBitmapLookupRequired(w) && !naccBareTagHit(w) && !naccBitmapFatalApplies(w))
+  val naccPhysicalPrivilegeAllowed = widthMap(w => {
+    val requestPrivilege = if (boomParams.useNACC) Mux(io.req(w).bits.passthrough, io.req(w).bits.prv, priv) else priv
+    requestPrivilege === PRV.M.U || (requestPrivilege === PRV.S.U && naccAgentMode)
+  })
   val pmp = Seq.fill(memWidth) { Module(new PMPChecker(lgMaxSize)) }
   for (w <- 0 until memWidth) {
     pmp(w).io.addr := mpu_physaddr(w)
     pmp(w).io.size := io.req(w).bits.size
     pmp(w).io.pmp := (io.ptw.pmp: Seq[PMP])
-    pmp(w).io.prv := Mux(usingVM.B && (do_refill || io.req(w).bits.passthrough /* PTW */), PRV.S.U, priv) // TODO should add separate bit to track PTW
+    pmp(w).io.prv := (if (boomParams.useNACC) {
+      // Refill仍是S-effective；physical HellaCache request必须保留其真实dprv。
+      Mux(usingVM.B && do_refill, PRV.S.U, Mux(io.req(w).bits.passthrough, io.req(w).bits.prv, priv))
+    } else {
+      Mux(usingVM.B && (do_refill || io.req(w).bits.passthrough /* PTW */), PRV.S.U, priv)
+    })
   }
   val legal_address = widthMap(w => edge.manager.findSafe(mpu_physaddr(w)).reduce(_||_))
   def fastCheck(member: TLManagerParameters => Boolean, w: Int) =
@@ -206,19 +296,25 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     newEntry.paa := prot_aa(0)
     newEntry.eff := prot_eff(0)
     newEntry.inNACCAgentRegion.foreach(_ := inNACCAgentRegion(refill_ppn << pgIdxBits))
+    newEntry.naccBitmapTag.foreach(_ := io.ptw.resp.bits.naccBitmapTag.get)
     newEntry.fragmented_superpage := io.ptw.resp.bits.fragmented_superpage
 
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
-      special_entry.foreach(_.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry))
+      special_entry.foreach { e =>
+        e.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry)
+        if (boomParams.useNACC) when (invalidate_refill) { e.invalidate() }
+      }
     }.elsewhen (io.ptw.resp.bits.level < (pgLevels-1).U) {
       for ((e, i) <- superpage_entries.zipWithIndex) when (r_superpage_repl_addr === i.U) {
         e.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry)
+        if (boomParams.useNACC) when (invalidate_refill) { e.invalidate() }
       }
     }.otherwise {
       val waddr = Mux(r_sectored_hit, r_sectored_hit_addr, r_sectored_repl_addr)
       for ((e, i) <- sectored_entries.zipWithIndex) when (waddr === i.U) {
         when (!r_sectored_hit) { e.invalidate() }
         e.insert(r_refill_tag, 0.U, newEntry)
+        if (boomParams.useNACC) when (invalidate_refill) { e.invalidate() }
       }
     }
   }
@@ -233,14 +329,53 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val w_array      = widthMap(w => Cat(true.B, priv_rw_ok(w) & entries(w).map(_.sw).asUInt))
   val x_array      = widthMap(w => Cat(true.B, priv_x_ok(w)  & entries(w).map(_.sx).asUInt))
   val nacc_access_array = widthMap(w => if (boomParams.useNACC) {
-    val physicalAccessAllowed = !inNACCAgentRegion(mpu_physaddr(w)) || naccPrivilegeAllowed
-    val entryAccessAllowed = normal_entries(w).map(e => !e.inNACCAgentRegion.get || naccPrivilegeAllowed)
+    val physicalAccessAllowed = !inNACCAgentRegion(mpu_physaddr(w)) || naccPhysicalPrivilegeAllowed(w)
+    val entryAccessAllowed = normal_entries(w).map(e => !e.inNACCAgentRegion.get || naccEntryPrivilegeAllowed)
     Cat(Fill(nPhysicalEntries, physicalAccessAllowed), entryAccessAllowed.asUInt)
   } else {
     Fill(nPhysicalEntries + normal_entries(w).size, true.B)
   })
-  val pr_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_r(w))   , normal_entries(w).map(_.pr).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w))
-  val pw_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_w(w))   , normal_entries(w).map(_.pw).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w))
+  val naccRootReadArray = widthMap(w => if (boomParams.useNACC) {
+    def allowed(tag: UInt, finalPPN: UInt): Bool = {
+      priv === PRV.M.U || tag =/= NACCBitmapTag.RootL0.U ||
+        (naccConfidentialActive && io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) &&
+          finalPPN === io.ptw.ptbr.ppn)
+    }
+    val physicalTag = Mux(naccBareBitmapLookupRequired(w), naccBareTag.get, NACCBitmapTag.Normal.U)
+    val physicalAllowed = !naccBareBitmapLookupRequired(w) ||
+      !naccBareTagHit(w) || allowed(physicalTag, naccBarePPN(w))
+    val entryAllowed = (entries(w).zip(all_entries)).map { case (entry, tlbEntry) =>
+      allowed(entry.naccBitmapTag.get, tlbEntry.ppn(vpn(w)))
+    }
+    Cat(physicalAllowed, entryAllowed.asUInt)
+  } else {
+    Fill(nPhysicalEntries + normal_entries(w).size, true.B)
+  })
+  val naccRootWriteArray = widthMap(w => if (boomParams.useNACC) {
+    val offsetWidth = pgIdxBits + 1
+    val accessStart = io.req(w).bits.vaddr(pgIdxBits - 1, 0).padTo(offsetWidth)
+    val accessBytes = (1.U(offsetWidth.W) << io.req(w).bits.size)(offsetWidth - 1, 0)
+    val accessEnd = accessStart +& accessBytes
+    val entirelyInKernelHalf = accessStart >= (BigInt(1) << (pgIdxBits - 1)).U &&
+      accessEnd <= (BigInt(1) << pgIdxBits).U
+    def allowed(tag: UInt, finalPPN: UInt): Bool = {
+      priv === PRV.M.U || tag =/= NACCBitmapTag.RootL0.U ||
+        (priv === PRV.S.U && naccConfidentialActive &&
+          io.ptw.ptbr.mode(io.ptw.ptbr.mode.getWidth - 1) && finalPPN === io.ptw.ptbr.ppn &&
+          entirelyInKernelHalf)
+    }
+    val physicalTag = Mux(naccBareBitmapLookupRequired(w), naccBareTag.get, NACCBitmapTag.Normal.U)
+    val physicalAllowed = !naccBareBitmapLookupRequired(w) ||
+      !naccBareTagHit(w) || allowed(physicalTag, naccBarePPN(w))
+    val entryAllowed = (entries(w).zip(all_entries)).map { case (entry, tlbEntry) =>
+      allowed(entry.naccBitmapTag.get, tlbEntry.ppn(vpn(w)))
+    }
+    Cat(physicalAllowed, entryAllowed.asUInt)
+  } else {
+    Fill(nPhysicalEntries + normal_entries(w).size, true.B)
+  })
+  val pr_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_r(w))   , normal_entries(w).map(_.pr).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w) & naccRootReadArray(w))
+  val pw_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_w(w))   , normal_entries(w).map(_.pw).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w) & naccRootWriteArray(w))
   val px_array     = widthMap(w => Cat(Fill(nPhysicalEntries, prot_x(w))   , normal_entries(w).map(_.px).asUInt) & ~ptw_ae_array(w) & nacc_access_array(w))
   val eff_array    = widthMap(w => Cat(Fill(nPhysicalEntries, prot_eff(w)) , normal_entries(w).map(_.eff).asUInt))
   val c_array      = widthMap(w => Cat(Fill(nPhysicalEntries, cacheable(w)), normal_entries(w).map(_.c).asUInt))
@@ -260,6 +395,10 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
       io.ptw.ptbr.additionalPgLevels === i.U && !(maskedVAddr === 0.U || maskedVAddr === mask)
     }).orR
   })
+  val naccRootValidationMiss = widthMap(w => boomParams.useNACC.B && vm_enabled(w) && !bad_va(w) &&
+    naccRootInBitmapTarget && !naccRootTagKnown && !naccBitmapFatalApplies(w))
+  val naccRootDenied = widthMap(w => boomParams.useNACC.B && vm_enabled(w) && !bad_va(w) &&
+    !naccRootValidationMiss(w) && !naccRootAllowed && !naccBitmapFatalApplies(w))
 
   val cmd_lrsc           = widthMap(w => usingAtomics.B && io.req(w).bits.cmd.isOneOf(M_XLR, M_XSC))
   val cmd_amo_logical    = widthMap(w => usingAtomics.B && isAMOLogical(io.req(w).bits.cmd))
@@ -268,6 +407,11 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val cmd_write          = widthMap(w => isWrite(io.req(w).bits.cmd))
   val cmd_write_perms    = widthMap(w => cmd_write(w) ||
     coreParams.haveCFlush.B && io.req(w).bits.cmd === M_FLUSH_ALL) // not a write, but needs write permissions
+  val naccRootReadDenied = widthMap(w => boomParams.useNACC.B && !bad_va(w) && cmd_read(w) &&
+    ((~naccRootReadArray(w)) & hits(w)).orR)
+  val naccRootWriteDenied = widthMap(w => boomParams.useNACC.B && !bad_va(w) && cmd_write_perms(w) &&
+    ((~naccRootWriteArray(w)) & hits(w)).orR)
+  val naccRootPolicyDenied = widthMap(w => naccRootReadDenied(w) || naccRootWriteDenied(w))
 
   val lrscAllowed = widthMap(w => Mux((usingDataScratchpad || usingAtomicsOnlyForIO).B, 0.U, c_array(w)))
   val ae_array = widthMap(w =>
@@ -291,7 +435,9 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val pf_inst_array = widthMap(w => ~(x_array(w) | ptw_ae_array(w)))
 
   val tlb_hit = widthMap(w => real_hits(w).orR)
-  val tlb_miss = widthMap(w => vm_enabled(w) && !bad_va(w) && !tlb_hit(w))
+  val tlb_miss = widthMap(w =>
+    vm_enabled(w) && !bad_va(w) && !tlb_hit(w) && !naccBitmapFatalApplies(w) &&
+      !naccRootValidationMiss(w) && !naccRootDenied(w))
 
   val sectored_plru = new PseudoLRU(sectored_entries.size)
   val superpage_plru = new PseudoLRU(superpage_entries.size)
@@ -312,34 +458,75 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   io.miss_rdy := state === s_ready
   for (w <- 0 until memWidth) {
     io.req(w).ready    := true.B
-    io.resp(w).pf.ld   := (bad_va(w) && cmd_read(w)) || (pf_ld_array(w) & hits(w)).orR
-    io.resp(w).pf.st   := (bad_va(w) && cmd_write_perms(w)) || (pf_st_array(w) & hits(w)).orR
-    io.resp(w).pf.inst := bad_va(w) || (pf_inst_array(w) & hits(w)).orR
-    io.resp(w).ae.ld   := (ae_valid_array(w) & ae_ld_array(w) & hits(w)).orR
-    io.resp(w).ae.st   := (ae_valid_array(w) & ae_st_array(w) & hits(w)).orR
-    io.resp(w).ae.inst := (ae_valid_array(w) & ~px_array(w)   & hits(w)).orR
-    io.resp(w).ma.ld   := (ma_ld_array(w) & hits(w)).orR
-    io.resp(w).ma.st   := (ma_st_array(w) & hits(w)).orR
+    io.resp(w).pf.ld   := !naccBitmapFatalApplies(w) && !naccRootDenied(w) && !naccRootPolicyDenied(w) && ((bad_va(w) && cmd_read(w)) || (pf_ld_array(w) & hits(w)).orR)
+    io.resp(w).pf.st   := !naccBitmapFatalApplies(w) && !naccRootDenied(w) && !naccRootPolicyDenied(w) && ((bad_va(w) && cmd_write_perms(w)) || (pf_st_array(w) & hits(w)).orR)
+    io.resp(w).pf.inst := !naccBitmapFatalApplies(w) && !naccRootDenied(w) && !naccRootPolicyDenied(w) && (bad_va(w) || (pf_inst_array(w) & hits(w)).orR)
+    io.resp(w).ae.ld   := Mux(naccBitmapFatalApplies(w) || naccRootDenied(w) || naccRootPolicyDenied(w), cmd_read(w), (ae_valid_array(w) & ae_ld_array(w) & hits(w)).orR)
+    io.resp(w).ae.st   := Mux(naccBitmapFatalApplies(w) || naccRootDenied(w) || naccRootPolicyDenied(w), cmd_write_perms(w), (ae_valid_array(w) & ae_st_array(w) & hits(w)).orR)
+    io.resp(w).ae.inst := Mux(naccBitmapFatalApplies(w) || naccRootDenied(w) || naccRootPolicyDenied(w), instruction.B, (ae_valid_array(w) & ~px_array(w) & hits(w)).orR)
+    io.resp(w).ma.ld   := !naccBitmapFatalApplies(w) && !naccRootDenied(w) && !naccRootPolicyDenied(w) && (ma_ld_array(w) & hits(w)).orR
+    io.resp(w).ma.st   := !naccBitmapFatalApplies(w) && !naccRootDenied(w) && !naccRootPolicyDenied(w) && (ma_st_array(w) & hits(w)).orR
     io.resp(w).ma.inst := false.B // this is up to the pipeline to figure out
     io.resp(w).cacheable    := (c_array(w) & hits(w)).orR
     io.resp(w).must_alloc   := (must_alloc_array(w) & hits(w)).orR
     io.resp(w).prefetchable := (prefetchable_array(w) & hits(w)).orR && edge.manager.managers.forall(m => !m.supportsAcquireB || m.supportsHint).B
-    io.resp(w).miss  := do_refill || tlb_miss(w) || multipleHits(w)
+    io.resp(w).miss  := Mux(naccBitmapFatalApplies(w) || naccRootDenied(w) || naccRootPolicyDenied(w), false.B,
+      ptwTranslationResponse || naccBitmapOnlyResponse || tlb_miss(w) || naccBareBitmapMiss(w) ||
+        naccRootValidationMiss(w) || multipleHits(w))
     io.resp(w).paddr := Cat(ppn(w), io.req(w).bits.vaddr(pgIdxBits-1, 0))
     io.resp(w).size := io.req(w).bits.size
     io.resp(w).cmd := io.req(w).bits.cmd
   }
 
-  io.ptw.req.valid := state === s_request
+  val naccPendingPTWBlocked = if (boomParams.useNACC) {
+    state === s_request && r_naccPendingRequestEffectiveSU.get && naccBitmapFatal
+  } else {
+    false.B
+  }
+  io.ptw.req.valid := state === s_request && !naccPendingPTWBlocked
   io.ptw.req.bits.valid := !io.kill
   io.ptw.req.bits.bits.addr := r_refill_tag
+  io.ptw.req.bits.bits.naccBitmapOnly.foreach(_ := r_naccBitmapOnly.getOrElse(false.B))
+  io.ptw.req.bits.bits.naccBitmapPPN.foreach(_ := r_naccBitmapPPN.getOrElse(0.U))
+  io.ptw.req.bits.bits.naccRootValidationOnly.foreach(_ := r_naccRootValidationOnly.getOrElse(false.B))
+  if (boomParams.useNACC) {
+    // 当前NACC只支持no-hypervisor；bitmap-only请求必须显式关闭两阶段translation字段。
+    io.ptw.req.bits.bits.need_gpa := false.B
+    io.ptw.req.bits.bits.vstage1 := false.B
+    io.ptw.req.bits.bits.stage2 := false.B
+  }
 
   if (usingVM) {
     val sfence = io.sfence.valid
+    if (boomParams.useNACC) {
+      when (io.ptw.req.fire && io.ptw.req.bits.valid && r_naccBitmapOnly.get) {
+        r_naccBitmapResponseStale.get := false.B
+      }
+      when ((sfence || io.kill) && state =/= s_ready && r_naccBitmapOnly.get) {
+        r_naccBitmapResponseStale.get := true.B
+      }
+      when (sfence) {
+        naccBareTagValid.get := false.B
+      }
+      when (naccBitmapOnlyResponse) {
+        assert(r_naccBitmapOnly.get, "NACC bitmap-only response without a matching NBDTLB request")
+        when (!naccRootValidationOnlyResponse && state === s_wait &&
+          !r_naccBitmapResponseStale.get && !sfence && !io.kill && !naccBitmapFatal) {
+          naccBareTagValid.get := true.B
+          naccBareTagPPN.get := r_naccBitmapPPN.get
+          naccBareTag.get := io.ptw.resp.bits.naccBitmapTag.get
+        }
+      }
+    }
     for (w <- 0 until memWidth) {
-      when (io.req(w).fire && tlb_miss(w) && state === s_ready) {
+      when (io.req(w).fire && (tlb_miss(w) || naccBareBitmapMiss(w) || naccRootValidationMiss(w)) && state === s_ready) {
         state := s_request
         r_refill_tag := vpn(w)
+        val naccMetadataOnly = naccBareBitmapMiss(w) || naccRootValidationMiss(w)
+        r_naccBitmapOnly.foreach(_ := naccMetadataOnly)
+        r_naccBitmapPPN.foreach(_ := Mux(naccRootValidationMiss(w), io.ptw.ptbr.ppn, naccBarePPN(w)))
+        r_naccRootValidationOnly.foreach(_ := naccRootValidationMiss(w))
+        r_naccPendingRequestEffectiveSU.foreach(_ := priv_uses_vm && !io.req(w).bits.passthrough)
 
         r_superpage_repl_addr := replacementEntry(superpage_entries, superpage_plru.way)
         r_sectored_repl_addr  := replacementEntry(sectored_entries, sectored_plru.way)
@@ -351,6 +538,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
       when (sfence) { state := s_ready }
       when (io.ptw.req.ready) { state := Mux(sfence, s_wait_invalidate, s_wait) }
       when (io.kill) { state := s_ready }
+      when (naccPendingPTWBlocked) { state := s_ready }
     }
     when (state === s_wait && sfence) {
       state := s_wait_invalidate

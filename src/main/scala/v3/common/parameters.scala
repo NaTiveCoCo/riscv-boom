@@ -156,20 +156,26 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     }
   }
 
-  protected def naccAgentRegionCSRs = {
+  private def naccPageAlignedCSRs(ids: Int*): Seq[CustomCSR] = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
     if (params.useNACC) {
       val pageOffsetBits = 12
       val pageAlignedAddressMask = (BigInt(1) << xLen) - (BigInt(1) << pageOffsetBits)
-      Seq(
-        CustomCSR(0x3f1, pageAlignedAddressMask, Some(BigInt(0))),
-        CustomCSR(0x3f2, pageAlignedAddressMask, Some(BigInt(0)))
-      )
+      ids.map(id => CustomCSR(id, pageAlignedAddressMask, Some(BigInt(0))))
     } else {
       Nil
     }
   }
 
+  protected def naccAgentRegionCSRs = naccPageAlignedCSRs(0x3f1, 0x3f2)
+
+  // PFN bitmap 的配置：storage base、target range 的起止（exclusive end）。
+  // 三者都 4 KiB 对齐，由可信 M-mode 在进入不可信执行环境前配置完毕，之后不变。
+  //
+  // 注意编号仍落在 0x3F0–0x3FF，那是标准 M-mode 保留区（紧邻 pmpaddr63），不是
+  // custom 区。asstatus/asepc 已经迁进 custom 区，Agent region 与 bitmap 这五个
+  // 尚未迁——迁移会与 bitmap 侧的在途工作冲突，留待编号整体调整时一并处理。
+  protected def naccBitmapCSRs = naccPageAlignedCSRs(0x3f3, 0x3f4, 0x3f5)
 
   override def chickenCSR = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
@@ -192,10 +198,13 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
   override def asEpcValue = getByIdOrElse(NACCCSRs.asepc, _.value, 0.U(xLen.W))
   override def naccSagentValue = getByIdOrElse(0x3f1, _.value, 0.U(xLen.W))
   override def naccEagentValue = getByIdOrElse(0x3f2, _.value, 0.U(xLen.W))
+  override def naccBitmapStorageBaseValue = getByIdOrElse(0x3f3, _.value, 0.U(xLen.W))
+  override def naccBitmapTargetStartValue = getByIdOrElse(0x3f4, _.value, 0.U(xLen.W))
+  override def naccBitmapTargetEndValue = getByIdOrElse(0x3f5, _.value, 0.U(xLen.W))
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
   override def decls: Seq[CustomCSR] =
-    super.decls ++ Seq(marchid) ++ asModeCSRs ++ naccAgentRegionCSRs
+    super.decls ++ Seq(marchid) ++ asModeCSRs ++ naccAgentRegionCSRs ++ naccBitmapCSRs
 }
 
 /**
