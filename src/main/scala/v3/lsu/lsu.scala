@@ -226,7 +226,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           stq_tail === stq_execute_head,
             "stq_execute_head got off track.")
 
-  val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_wait :: h_replay :: h_dead :: Nil = Enum(7)
+  val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_s2_xcpt :: h_wait :: h_replay :: h_dead :: Nil = Enum(8)
   // s1 : do TLB, if success and not killed, fire request go to h_s2
   //      store s1_data to register
   //      if tlb miss, go to s2_nack
@@ -720,6 +720,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
   val exe_tlb_miss  = widthMap(w => dtlb.io.req(w).valid && (dtlb.io.resp(w).miss || !dtlb.io.req(w).ready))
+  val exe_tlb_xcpt  = widthMap(w => dtlb.io.req(w).valid && (
+    dtlb.io.resp(w).ma.ld || dtlb.io.resp(w).ma.st ||
+    dtlb.io.resp(w).pf.ld || dtlb.io.resp(w).pf.st ||
+    dtlb.io.resp(w).ae.ld || dtlb.io.resp(w).ae.st))
   val exe_tlb_paddr = widthMap(w => Cat(dtlb.io.resp(w).paddr(paddrBits-1,corePgIdxBits),
                                         exe_tlb_vaddr(w)(corePgIdxBits-1,0)))
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
@@ -827,7 +831,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     } .elsewhen (will_fire_hella_incoming(w)) {
       assert(hella_state === h_s1)
 
-      dmem_req(w).valid               := !io.hellacache.s1_kill && (!exe_tlb_miss(w) || hella_req.phys)
+      // physical HellaCache request 仍须接受 dprv 对应的 PMP 检查。TLB 已报告异常时不再
+      // 向 DCache 发请求，否则单周期 DCache response 可能在进入 h_dead 前被丢失，
+      // 使 HellaCache/PTW 永久停在等待状态。
+      dmem_req(w).valid               := !io.hellacache.s1_kill &&
+        (!exe_tlb_miss(w) || hella_req.phys) && !exe_tlb_xcpt(w)
       dmem_req(w).bits.addr           := exe_tlb_paddr(w)
       dmem_req(w).bits.data           := (new freechips.rocketchip.rocket.StoreGen(
         hella_req.size, 0.U,
@@ -1574,11 +1582,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
     } .elsewhen (will_fire_hella_incoming(memWidth-1) && dmem_req_fire(memWidth-1)) {
       hella_state := h_s2
+    } .elsewhen (will_fire_hella_incoming(memWidth-1) && exe_tlb_xcpt(memWidth-1)) {
+      hella_state := h_s2_xcpt
     } .otherwise {
       hella_state := h_s2_nack
     }
   } .elsewhen (hella_state === h_s2_nack) {
     io.hellacache.s2_nack := true.B
+    hella_state := h_ready
+  } .elsewhen (hella_state === h_s2_xcpt) {
+    io.hellacache.s2_xcpt := hella_xcpt
     hella_state := h_ready
   } .elsewhen (hella_state === h_s2) {
     io.hellacache.s2_xcpt := hella_xcpt
