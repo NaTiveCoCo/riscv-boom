@@ -241,6 +241,9 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
   val hellaCacheArb = Module(new HellaCacheArbiter(hellaCachePorts.length)(outer.p))
   hellaCacheArb.io.requestor <> hellaCachePorts.toSeq
   lsu.io.hellacache <> hellaCacheArb.io.mem
+  // PTW 是仲裁器最高优先级的 requestor 0；随 req.fire 在 LSU 内锁存来源。
+  // 不把任意 RoCC physical request 当成 PTW，避免放宽普通 requester 权限。
+  lsu.io.naccPTW.foreach(_ := ptw.io.mem.req.valid)
   outer.dcache.module.io.lsu <> lsu.io.dmem
 
   // Generate a descriptive string

@@ -21,6 +21,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     "NACC currently requires RV64 Sv39")
   val io = IO(new Bundle {
     val req = Flipped(Vec(memWidth, Decoupled(new TLBReq(lgMaxSize))))
+    val naccPTW = boomParams.useNACC.option(Input(Vec(memWidth, Bool())))
     val miss_rdy = Output(Bool())
     val resp = Output(Vec(memWidth, new TLBResp))
     val sfence = Input(Valid(new SFenceReq))
@@ -366,9 +367,15 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val w_array      = widthMap(w => Cat(true.B, priv_rw_ok(w) & entries(w).map(_.sw).asUInt))
   val x_array      = widthMap(w => Cat(true.B, priv_x_ok(w)  & entries(w).map(_.sx).asUInt))
   val nacc_access_array = widthMap(w => if (boomParams.useNACC) {
-    val physicalAccessAllowed =
+    // 仅可信 PTW 内部请求绕过 ordinary Agent/backing gate；PMP/PMA 仍在 prot_* 合取。
+    // 来源由 tile 仲裁器传入，不从当前 A 或 passthrough 单独推断。
+    val ptwAccess = io.naccPTW.get(w) && io.req(w).bits.passthrough
+    when (io.req(w).valid && io.naccPTW.get(w)) {
+      assert(io.req(w).bits.passthrough, "NACC PTW request must use a physical address")
+    }
+    val physicalAccessAllowed = ptwAccess || (
       (!inNACCAgentRegion(mpu_physaddr(w)) || naccPhysicalPrivilegeAllowed(w)) &&
-      (!overlapsNACCBitmapStorage(mpu_ppn(w), w) || naccPhysicalPrivilegeAllowed(w))
+      (!overlapsNACCBitmapStorage(mpu_ppn(w), w) || naccPhysicalPrivilegeAllowed(w)))
     val entryAccessAllowed = (normal_entries(w).zip(ordinary_entries)).map { case (entry, tlbEntry) =>
       (!entry.inNACCAgentRegion.get || naccEntryPrivilegeAllowed) &&
         (!overlapsNACCBitmapStorage(tlbEntry.ppn(vpn(w)), w) || naccEntryPrivilegeAllowed)

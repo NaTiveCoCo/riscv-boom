@@ -162,6 +162,7 @@ class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
   val dmem  = new LSUDMemIO
 
   val hellacache = Flipped(new freechips.rocketchip.rocket.HellaCacheIO)
+  val naccPTW = if (boomParams.useNACC) Some(Input(Bool())) else None
 }
 
 class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
@@ -239,6 +240,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // dead : wait for response, ignore it
   val hella_state           = RegInit(h_ready)
   val hella_req             = Reg(new rocket.HellaCacheReq)
+  val hella_is_ptw = if (boomParams.useNACC) {
+    Some(RegEnable(io.naccPTW.get, false.B, io.hellacache.req.fire))
+  } else None
   val hella_data            = Reg(new rocket.HellaCacheWriteData)
   val hella_paddr           = Reg(UInt(paddrBits.W))
   val hella_xcpt            = Reg(new rocket.HellaCacheExceptions)
@@ -429,7 +433,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ldq_wakeup_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i=> {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
-    e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
+    e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block &&
+      (!boomParams.useNACC.B || !e.uop.exception)
   }), ldq_head))
   val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
 
@@ -499,6 +504,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val block_load_wakeup = WireInit(false.B)
   val can_fire_load_wakeup = widthMap(w =>
                              ( ldq_wakeup_e.valid                                      &&
+                              (!boomParams.useNACC.B || !ldq_wakeup_e.bits.uop.exception) &&
                                ldq_wakeup_e.bits.addr.valid                            &&
                               !ldq_wakeup_e.bits.succeeded                             &&
                               !ldq_wakeup_e.bits.addr_is_virtual                       &&
@@ -656,6 +662,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dtlb.io.req(w).bits.size        := exe_size(w)
     dtlb.io.req(w).bits.cmd         := exe_cmd(w)
     dtlb.io.req(w).bits.passthrough := exe_passthr(w)
+    dtlb.io.naccPTW.foreach(_(w) := will_fire_hella_incoming(w) && hella_is_ptw.get)
     dtlb.io.req(w).bits.v           := io.ptw.status.v
     dtlb.io.req(w).bits.prv         := exe_prv(w)
   }
@@ -770,6 +777,14 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     io.dmem.s1_kill(w) := false.B
 
+    if (boomParams.useNACC) {
+      when (dmem_req_fire(w) && !dmem_req(w).bits.is_hella && dmem_req(w).bits.uop.uses_ldq) {
+        assert(!dmem_req(w).bits.uop.exception &&
+          !ldq(dmem_req(w).bits.uop.ldq_idx).bits.uop.exception,
+          "NACC faulting load must not issue or replay to DCache")
+      }
+    }
+
     when (will_fire_load_incoming(w)) {
       // NACC fatal沿既有ae.ld exception path交付；faulting load不得同时访问DCache。
       dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w) &&
@@ -845,7 +860,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (will_fire_load_incoming(w) || will_fire_load_retry(w))
     {
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
-      ldq(ldq_idx).bits.addr.valid          := true.B
+      // Fault 不是 DCache nack：不得把拒绝访问登记成可免 TLB 重发的物理请求。
+      ldq(ldq_idx).bits.addr.valid          := !boomParams.useNACC.B ||
+        !(ae_ld(w) || pf_ld(w) || ma_ld(w))
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
