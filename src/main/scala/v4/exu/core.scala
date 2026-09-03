@@ -1432,8 +1432,9 @@ class BoomCore(roccCSRs: Seq[Seq[CustomCSR]])(implicit p: Parameters) extends Bo
       //     RegNext(Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen)))
       // }
 
-      // These csr signals do not exactly match up with the ROB commit signals.
-      io.trace.insns(w).priv       := RegNext(Cat(RegNext(RegNext(csr.io.status.debug)), csr.io.status.prv))
+      // CSR return 指令会在 ROB retire 前一拍更新 current world/privilege；这里与
+      // commit log 的两拍 source-state 取样保持一致，再与延后一拍的 trace valid 对齐。
+      io.trace.insns(w).priv       := RegNext(Cat(RegNext(csr.io.naccA), RegNext(csr.io.status.debug), RegNext(csr.io.status.prv)))
       // Can determine if it is an interrupt or not based on the MSB of the cause
       io.trace.insns(w).exception  := RegNext(rob.io.com_xcpt.valid && !rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
       io.trace.insns(w).interrupt  := RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
