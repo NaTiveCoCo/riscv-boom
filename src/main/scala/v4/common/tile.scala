@@ -272,12 +272,12 @@ class BoomTileModuleImp(outer: BoomTile) extends BaseTileModuleImp(outer){
       outer.trace_encoder.get.module.io.control <> lm.module.io.control
     }
 
-    val trace_sink_arbiter = Module(new TraceSinkArbiter(outer.traceSinkIds, 
-      use_monitor = outer.boomParams.traceParams.get.useArbiterMonitor, 
+    val trace_sink_arbiter = Module(new TraceSinkArbiter(outer.traceSinkIds,
+      use_monitor = outer.boomParams.traceParams.get.useArbiterMonitor,
       monitor_name = outer.boomParams.uniqueName))
 
     trace_sink_arbiter.io.target := outer.trace_encoder.get.module.io.control.target
-    trace_sink_arbiter.io.in <> outer.trace_encoder.get.module.io.out 
+    trace_sink_arbiter.io.in <> outer.trace_encoder.get.module.io.out
 
     core.io.traceStall := outer.trace_encoder.get.module.io.stall
 

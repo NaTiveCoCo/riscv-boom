@@ -277,6 +277,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   custom_csrs.csrs.foreach { c => c.stall := false.B; c.set := false.B; c.sdata := DontCare }
 
   (custom_csrs.csrs zip csr.io.customCSRs).map { case (lhs, rhs) => lhs <> rhs }
+  (io.ptw.customCSRs.csrs zip custom_csrs.csrs).foreach { case (out, local) =>
+    out.ren := local.ren
+    out.wen := local.wen
+    out.wdata := local.wdata
+    out.value := local.value
+  }
 
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
@@ -1003,6 +1009,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   csr.io.rw.addr        := csr_exe_unit.io.iresp.bits.uop.csr_addr
   csr.io.rw.cmd         := freechips.rocketchip.rocket.CSR.maskCmd(csr_exe_unit.io.iresp.valid, csr_rw_cmd)
+  csr.io.rw.inst.foreach(_ := csr_exe_unit.io.iresp.bits.uop.inst)
   csr.io.rw.wdata       := wb_wdata
 
   rob.io.csr_replay.valid := csr_exe_unit.io.iresp.valid && csr.io.rw_stall
@@ -1481,8 +1488,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       //     RegNext(Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen)))
       // }
 
-      // These csr signals do not exactly match up with the ROB commit signals.
-      io.trace.insns(w).priv       := RegNext(Cat(RegNext(csr.io.status.debug), csr.io.status.prv))
+      // CSR return 指令会在 ROB retire 前一拍更新 current world/privilege；这里与
+      // commit log 的两拍 source-state 取样保持一致，再与延后一拍的 trace valid 对齐。
+      io.trace.insns(w).priv       := RegNext(Cat(RegNext(csr.io.naccA), RegNext(csr.io.status.debug), RegNext(csr.io.status.prv)))
       // Can determine if it is an interrupt or not based on the MSB of the cause
       io.trace.insns(w).exception  := RegNext(rob.io.com_xcpt.valid && !rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
       io.trace.insns(w).interrupt  := RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B

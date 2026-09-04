@@ -53,8 +53,8 @@ class BoomCore(roccCSRs: Seq[Seq[CustomCSR]])(implicit p: Parameters) extends Bo
   with HasFPUParameters
 {
   val nTotalRoCCCSRs = roccCSRs.flatten.size
-  val traceIngressParams = TraceCoreParams(nGroups = boomParams.retireWidth, iretireWidth = 1, 
-                                            xlen = coreParams.xLen, iaddrWidth = vaddrBitsExtended) 
+  val traceIngressParams = TraceCoreParams(nGroups = boomParams.retireWidth, iretireWidth = 1,
+                                            xlen = coreParams.xLen, iaddrWidth = vaddrBitsExtended)
   val io = IO(new freechips.rocketchip.tile.CoreBundle
   {
     val hartid = Input(UInt(hartIdLen.W))
@@ -1432,8 +1432,9 @@ class BoomCore(roccCSRs: Seq[Seq[CustomCSR]])(implicit p: Parameters) extends Bo
       //     RegNext(Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen)))
       // }
 
-      // These csr signals do not exactly match up with the ROB commit signals.
-      io.trace.insns(w).priv       := RegNext(Cat(RegNext(RegNext(csr.io.status.debug)), csr.io.status.prv))
+      // CSR return 指令会在 ROB retire 前一拍更新 current world/privilege；这里与
+      // commit log 的两拍 source-state 取样保持一致，再与延后一拍的 trace valid 对齐。
+      io.trace.insns(w).priv       := RegNext(Cat(RegNext(csr.io.naccA), RegNext(csr.io.status.debug), RegNext(csr.io.status.prv)))
       // Can determine if it is an interrupt or not based on the MSB of the cause
       io.trace.insns(w).exception  := RegNext(rob.io.com_xcpt.valid && !rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
       io.trace.insns(w).interrupt  := RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
@@ -1450,7 +1451,7 @@ class BoomCore(roccCSRs: Seq[Seq[CustomCSR]])(implicit p: Parameters) extends Bo
         val trace_ingress = Module(new TraceCoreIngress(traceIngressParams))
         trace_ingress.io.in.valid := RegNext(rob.io.commit.arch_valids(w))
         // this is predicted to be taken, but since it is commited, it must have been predicted correctly
-        trace_ingress.io.in.taken := RegNext(rob.io.commit.uops(w).taken) 
+        trace_ingress.io.in.taken := RegNext(rob.io.commit.uops(w).taken)
         trace_ingress.io.in.is_branch := RegNext(rob.io.commit.uops(w).is_br)
         trace_ingress.io.in.is_jal := RegNext(rob.io.commit.uops(w).is_jal)
         trace_ingress.io.in.is_jalr := RegNext(rob.io.commit.uops(w).is_jalr)

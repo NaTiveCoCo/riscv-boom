@@ -12,8 +12,9 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
 import freechips.rocketchip.rocket.Instructions32
 import freechips.rocketchip.rocket.CustomInstructions._
+
 import freechips.rocketchip.rocket.RVCExpander
-import freechips.rocketchip.rocket.{CSR,Causes}
+import freechips.rocketchip.rocket.{CSR,Causes,PRV}
 import freechips.rocketchip.util.{uintToBitPat,UIntIsOneOf}
 
 import FUConstants._
@@ -239,6 +240,7 @@ object XDecode extends DecodeConstants
   ECALL   -> List(Y, N, X, uopERET  ,IQT_INT, FU_CSR , RT_X  , RT_X  , RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, Y, Y, Y, CSR.I),
   EBREAK  -> List(Y, N, X, uopERET  ,IQT_INT, FU_CSR , RT_X  , RT_X  , RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, Y, Y, Y, CSR.I),
   SRET    -> List(Y, N, X, uopERET  ,IQT_INT, FU_CSR , RT_X  , RT_X  , RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, N, Y, Y, CSR.I),
+  ASRET   -> List(Y, N, X, uopERET  ,IQT_INT, FU_CSR , RT_X  , RT_X  , RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, N, Y, Y, CSR.I),
   MRET    -> List(Y, N, X, uopERET  ,IQT_INT, FU_CSR , RT_X  , RT_X  , RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, N, Y, Y, CSR.I),
   DRET    -> List(Y, N, X, uopERET  ,IQT_INT, FU_CSR , RT_X  , RT_X  , RT_X  , N, IS_I, N, N, N, N, N, M_X  , 0.U, N, N, N, Y, Y, CSR.I),
 
@@ -487,6 +489,8 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
 
   val inst = uop.inst
 
+  // ASRET 使用 reserved SYSTEM 编码；最终合法性仍由 CSRFile 的 hasNACC/current-AS
+  // 检查决定，NACC-disabled 配置会把它报告为 illegal instruction。
   val cs = Wire(new CtrlSigs()).decode(inst, decode_table)
 
   // Exception Handling
@@ -496,6 +500,8 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   val system_insn = cs.csr_cmd === CSR.I
   val sfence = cs.uopc === uopSFENCE
 
+  // twin_entry/trampoline 的 S-mode 动态写门控随这两个 CSR 一起消失：A 世界的
+  // trap CSR 改为独立编号、按「A=1 或 M」做普通访问控制，不再需要按 state 判定。
   val cs_legal = cs.legal
 //   dontTouch(cs_legal)
 

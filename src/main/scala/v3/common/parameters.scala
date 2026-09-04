@@ -92,6 +92,7 @@ case class BoomCoreParams(
   useHypervisor: Boolean = false,
   useVM: Boolean = true,
   useSCIE: Boolean = false,
+  useNACC: Boolean = false,
   useRVE: Boolean = false,
   useBPWatch: Boolean = false,
   clockGate: Boolean = false,
@@ -107,6 +108,7 @@ case class BoomCoreParams(
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
 {
+  override def hasNACC: Boolean = useNACC
   override def traceCustom = Some(new BoomTraceBundle)
   val xLen = 64
   val haveFSDirty = true
@@ -133,6 +135,54 @@ class BoomTraceBundle extends Bundle {
   */
 class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.CustomCSRs
   with HasBoomCoreParameters {
+  // NACC A-mode 的 CSR。它们都落在 custom RW 区，不占标准空间——标准只承诺
+  // custom 区不会被将来的扩展重新定义。
+  //
+  //   asstatus (0x7c2, machine custom)    世界切换状态 + A 世界的 trap 状态
+  //   astvec..asie (0x5c0..0x5c6)         A 世界独立 trap/interrupt CSR
+  //   aedeleg/aideleg (0x7c3..0x7c4)      M-managed A-side delegation
+  //
+  // 这里放开的是全部有存储的位；按当前 mode 的细分掩码由 CSRFile 施加（见 rocket
+  // 的 NACCStatus）。asstatus 的 `A` 位没有存储，故不在掩码内。
+  protected def asModeCSRs = {
+    val params = tileParams.core.asInstanceOf[BoomCoreParams]
+    if (params.useNACC) {
+      Seq(
+        CustomCSR(NACCCSRs.asstatus, NACCStatus.StoredMask, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.astvec, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.asepc, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.ascause, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.astval, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.asscratch, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.asip, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.asie, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.aedeleg, (BigInt(1) << xLen) - 1, Some(BigInt(0))),
+        CustomCSR(NACCCSRs.aideleg, (BigInt(1) << xLen) - 1, Some(BigInt(0)))
+      )
+    } else {
+      Nil
+    }
+  }
+
+  private def naccPageAlignedCSRs(ids: Int*): Seq[CustomCSR] = {
+    val params = tileParams.core.asInstanceOf[BoomCoreParams]
+    if (params.useNACC) {
+      val pageOffsetBits = 12
+      val pageAlignedAddressMask = (BigInt(1) << xLen) - (BigInt(1) << pageOffsetBits)
+      ids.map(id => CustomCSR(id, pageAlignedAddressMask, Some(BigInt(0))))
+    } else {
+      Nil
+    }
+  }
+
+  protected def naccAgentRegionCSRs = naccPageAlignedCSRs(NACCCSRs.sagent, NACCCSRs.eagent)
+
+  // PFN bitmap 的配置：storage base、target range 的起止（exclusive end）。
+  // 三者都 4 KiB 对齐，由可信 M-mode 在进入不可信执行环境前配置完毕，之后不变。
+  //
+  protected def naccBitmapCSRs = naccPageAlignedCSRs(
+    NACCCSRs.bitmapStorageBase, NACCCSRs.bitmapTargetStart, NACCCSRs.bitmapTargetEnd)
+
   override def chickenCSR = {
     val params = tileParams.core.asInstanceOf[BoomCoreParams]
     val mask = BigInt(
@@ -150,9 +200,17 @@ class BoomCustomCSRs(implicit p: Parameters) extends freechips.rocketchip.tile.C
     Some(CustomCSR(chickenCSRId, mask, Some(init)))
   }
   def disableOOO = getOrElse(chickenCSR, _.value(3), true.B)
+  override def asStatusValue = getByIdOrElse(NACCCSRs.asstatus, _.value, 0.U(xLen.W))
+  override def asEpcValue = getByIdOrElse(NACCCSRs.asepc, _.value, 0.U(xLen.W))
+  override def naccSagentValue = getByIdOrElse(NACCCSRs.sagent, _.value, 0.U(xLen.W))
+  override def naccEagentValue = getByIdOrElse(NACCCSRs.eagent, _.value, 0.U(xLen.W))
+  override def naccBitmapStorageBaseValue = getByIdOrElse(NACCCSRs.bitmapStorageBase, _.value, 0.U(xLen.W))
+  override def naccBitmapTargetStartValue = getByIdOrElse(NACCCSRs.bitmapTargetStart, _.value, 0.U(xLen.W))
+  override def naccBitmapTargetEndValue = getByIdOrElse(NACCCSRs.bitmapTargetEnd, _.value, 0.U(xLen.W))
   def marchid = CustomCSR.constant(CSRs.marchid, BigInt(2))
 
-  override def decls: Seq[CustomCSR] = super.decls :+ marchid
+  override def decls: Seq[CustomCSR] =
+    super.decls ++ Seq(marchid) ++ asModeCSRs ++ naccAgentRegionCSRs ++ naccBitmapCSRs
 }
 
 /**

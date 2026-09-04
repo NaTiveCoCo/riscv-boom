@@ -162,6 +162,7 @@ class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
   val dmem  = new LSUDMemIO
 
   val hellacache = Flipped(new freechips.rocketchip.rocket.HellaCacheIO)
+  val naccPTW = if (boomParams.useNACC) Some(Input(Bool())) else None
 }
 
 class LDQEntry(implicit p: Parameters) extends BoomBundle()(p)
@@ -225,7 +226,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
           stq_tail === stq_execute_head,
             "stq_execute_head got off track.")
 
-  val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_wait :: h_replay :: h_dead :: Nil = Enum(7)
+  val h_ready :: h_s1 :: h_s2 :: h_s2_nack :: h_s2_xcpt :: h_wait :: h_replay :: h_dead :: Nil = Enum(8)
   // s1 : do TLB, if success and not killed, fire request go to h_s2
   //      store s1_data to register
   //      if tlb miss, go to s2_nack
@@ -239,6 +240,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   // dead : wait for response, ignore it
   val hella_state           = RegInit(h_ready)
   val hella_req             = Reg(new rocket.HellaCacheReq)
+  val hella_is_ptw = if (boomParams.useNACC) {
+    Some(RegEnable(io.naccPTW.get, false.B, io.hellacache.req.fire))
+  } else None
   val hella_data            = Reg(new rocket.HellaCacheWriteData)
   val hella_paddr           = Reg(UInt(paddrBits.W))
   val hella_xcpt            = Reg(new rocket.HellaCacheExceptions)
@@ -429,7 +433,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ldq_wakeup_idx = RegNext(AgePriorityEncoder((0 until numLdqEntries).map(i=> {
     val e = ldq(i).bits
     val block = block_load_mask(i) || p1_block_load_mask(i)
-    e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block
+    e.addr.valid && !e.executed && !e.succeeded && !e.addr_is_virtual && !block &&
+      (!boomParams.useNACC.B || !e.uop.exception)
   }), ldq_head))
   val ldq_wakeup_e   = ldq(ldq_wakeup_idx)
 
@@ -499,6 +504,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val block_load_wakeup = WireInit(false.B)
   val can_fire_load_wakeup = widthMap(w =>
                              ( ldq_wakeup_e.valid                                      &&
+                              (!boomParams.useNACC.B || !ldq_wakeup_e.bits.uop.exception) &&
                                ldq_wakeup_e.bits.addr.valid                            &&
                               !ldq_wakeup_e.bits.succeeded                             &&
                               !ldq_wakeup_e.bits.addr_is_virtual                       &&
@@ -641,6 +647,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val exe_passthr= widthMap(w =>
                    Mux(will_fire_hella_incoming(w)  , hella_req.phys,
                                                       false.B))
+  val exe_prv    = widthMap(w => if (boomParams.useNACC) {
+                   Mux(will_fire_hella_incoming(w)  , hella_req.dprv,
+                                                      io.ptw.status.dprv)
+                 } else {
+                   io.ptw.status.prv
+                 })
   val exe_kill   = widthMap(w =>
                    Mux(will_fire_hella_incoming(w)  , io.hellacache.s1_kill,
                                                       false.B))
@@ -650,8 +662,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     dtlb.io.req(w).bits.size        := exe_size(w)
     dtlb.io.req(w).bits.cmd         := exe_cmd(w)
     dtlb.io.req(w).bits.passthrough := exe_passthr(w)
+    dtlb.io.naccPTW.foreach(_(w) := will_fire_hella_incoming(w) && hella_is_ptw.get)
     dtlb.io.req(w).bits.v           := io.ptw.status.v
-    dtlb.io.req(w).bits.prv         := io.ptw.status.prv
+    dtlb.io.req(w).bits.prv         := exe_prv(w)
   }
   dtlb.io.kill                      := exe_kill.reduce(_||_)
   dtlb.io.sfence                    := exe_sfence
@@ -707,6 +720,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   }
 
   val exe_tlb_miss  = widthMap(w => dtlb.io.req(w).valid && (dtlb.io.resp(w).miss || !dtlb.io.req(w).ready))
+  val exe_tlb_xcpt  = widthMap(w => dtlb.io.req(w).valid && (
+    dtlb.io.resp(w).ma.ld || dtlb.io.resp(w).ma.st ||
+    dtlb.io.resp(w).pf.ld || dtlb.io.resp(w).pf.st ||
+    dtlb.io.resp(w).ae.ld || dtlb.io.resp(w).ae.st))
   val exe_tlb_paddr = widthMap(w => Cat(dtlb.io.resp(w).paddr(paddrBits-1,corePgIdxBits),
                                         exe_tlb_vaddr(w)(corePgIdxBits-1,0)))
   val exe_tlb_uncacheable = widthMap(w => !(dtlb.io.resp(w).cacheable))
@@ -764,15 +781,26 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
     io.dmem.s1_kill(w) := false.B
 
+    if (boomParams.useNACC) {
+      when (dmem_req_fire(w) && !dmem_req(w).bits.is_hella && dmem_req(w).bits.uop.uses_ldq) {
+        assert(!dmem_req(w).bits.uop.exception &&
+          !ldq(dmem_req(w).bits.uop.ldq_idx).bits.uop.exception,
+          "NACC faulting load must not issue or replay to DCache")
+      }
+    }
+
     when (will_fire_load_incoming(w)) {
-      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
+      // NACC fatal沿既有ae.ld exception path交付；faulting load不得同时访问DCache。
+      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w) &&
+        !(boomParams.useNACC.B && ae_ld(w))
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
 
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
       assert(!ldq_incoming_e(w).bits.executed)
     } .elsewhen (will_fire_load_retry(w)) {
-      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
+      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w) &&
+        !(boomParams.useNACC.B && ae_ld(w))
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
 
@@ -803,7 +831,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     } .elsewhen (will_fire_hella_incoming(w)) {
       assert(hella_state === h_s1)
 
-      dmem_req(w).valid               := !io.hellacache.s1_kill && (!exe_tlb_miss(w) || hella_req.phys)
+      // physical HellaCache request 仍须接受 dprv 对应的 PMP 检查。TLB 已报告异常时不再
+      // 向 DCache 发请求，否则单周期 DCache response 可能在进入 h_dead 前被丢失，
+      // 使 HellaCache/PTW 永久停在等待状态。
+      dmem_req(w).valid               := !io.hellacache.s1_kill &&
+        (!exe_tlb_miss(w) || hella_req.phys) && !exe_tlb_xcpt(w)
       dmem_req(w).bits.addr           := exe_tlb_paddr(w)
       dmem_req(w).bits.data           := (new freechips.rocketchip.rocket.StoreGen(
         hella_req.size, 0.U,
@@ -836,7 +868,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (will_fire_load_incoming(w) || will_fire_load_retry(w))
     {
       val ldq_idx = Mux(will_fire_load_incoming(w), ldq_incoming_idx(w), ldq_retry_idx)
-      ldq(ldq_idx).bits.addr.valid          := true.B
+      // Fault 不是 DCache nack：不得把拒绝访问登记成可免 TLB 重发的物理请求。
+      ldq(ldq_idx).bits.addr.valid          := !boomParams.useNACC.B ||
+        !(ae_ld(w) || pf_ld(w) || ma_ld(w))
       ldq(ldq_idx).bits.addr.bits           := Mux(exe_tlb_miss(w), exe_tlb_vaddr(w), exe_tlb_paddr(w))
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
@@ -1548,11 +1582,16 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       }
     } .elsewhen (will_fire_hella_incoming(memWidth-1) && dmem_req_fire(memWidth-1)) {
       hella_state := h_s2
+    } .elsewhen (will_fire_hella_incoming(memWidth-1) && exe_tlb_xcpt(memWidth-1)) {
+      hella_state := h_s2_xcpt
     } .otherwise {
       hella_state := h_s2_nack
     }
   } .elsewhen (hella_state === h_s2_nack) {
     io.hellacache.s2_nack := true.B
+    hella_state := h_ready
+  } .elsewhen (hella_state === h_s2_xcpt) {
+    io.hellacache.s2_xcpt := hella_xcpt
     hella_state := h_ready
   } .elsewhen (hella_state === h_s2) {
     io.hellacache.s2_xcpt := hella_xcpt
